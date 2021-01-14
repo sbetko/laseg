@@ -1,0 +1,6 @@
+/.ipynb_checkpoints
+/__pycache__
+/images
+/la-seg
+/masks
+/unet.ipynb
