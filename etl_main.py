@@ -38,14 +38,30 @@ safe_mkdir([data_path,
             hi_res_path, hi_res_images_path, hi_res_masks_path,
             lo_res_path, lo_res_images_path, lo_res_masks_path])
 
+# if __name__ == '__main__':
+#     from etl import get_images
+
+#     num_imgs = 45
+
+#     sample_images_hi_res = [] #get_images(hi_res_images_path, n=num_imgs)
+#     sample_masks_hi_res = get_images(hi_res_masks_path, n=num_imgs)
+
+#     from etl import resampling_pipeline
+#     aug_masks = resampling_pipeline(sample_images_hi_res,
+#                                     sample_masks_hi_res,
+#                                     masks_only=True,
+#                                     n_jobs=1)
+
+
 if __name__ == '__main__':
-    from etl import get_images
+    import etl
 
-    num_imgs = 45
+    from time import time
 
-    sample_images_hi_res = [] #get_images(hi_res_images_path, n=num_imgs)
-    sample_masks_hi_res = get_images(hi_res_masks_path, n=num_imgs)
+    start = time()
 
-    from etl import resampling_pipeline
-    aug_masks = resampling_pipeline(sample_images_hi_res, sample_masks_hi_res, masks_only=True,
-                                    n_jobs=1)
+    etl.augmentation_pipeline(hi_res_images_path, hi_res_masks_path,
+                              lo_res_images_path, lo_res_masks_path,
+                              n_jobs=16)
+
+    print(f'Finished in {time() - start:.1f} s')

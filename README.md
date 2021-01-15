@@ -24,4 +24,4 @@ Given a fixed number of voxels to crop off of each dimension in a 3d image (the 
 
 For fixed ratio cropping to work in practice (i.e., to not risk cropping off regions of interest), we require an unusual condition: all of the bounding boxes of the *imaged structures* (in this case the left atria in each image) must be equidistant to the image boundary along each axis. In other words, there must be a uniform centering of all left atria within the image. Since there is natural centering variation between images, we instead seek to find appropriate cropping ratios for each image individually. We call this *dynamic ratio* cropping, where a heuristic is applied on each image to determine the best apportionment of the cropping quota between the starts and ends of each axis.
 
-![Fixed Ratio Cropping](fixed_ratio_cropping.png) ![Dynamic Ratio Cropping](dynamic_ratio_cropping.png)
+![Fixed Ratio Cropping](https://raw.githubusercontent.com/pkla/laseg/master/diagrams/fixed_ratio_cropping.png) ![Dynamic Ratio Cropping](https://raw.githubusercontent.com/pkla/laseg/master/diagrams/dynamic_ratio_cropping.png)

@@ -1,11 +1,7 @@
 import SimpleITK as sitk
+import pandas as pd
 import numpy as np
-import os 
-import itk
-import torch
-import time
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import os
 
 from zipfile import ZipFile
 import gzip
@@ -28,9 +24,7 @@ def resample_image(itk_image, out_spacing=(1.0, 1.0, 1.0), is_label=False):
     resample.SetOutputDirection(itk_image.GetDirection())
     resample.SetOutputOrigin(itk_image.GetOrigin())
     resample.SetTransform(sitk.Transform())
-
-    # resample.SetDefaultPixelValue(itk_image.GetPixelIDValue())
-    resample.SetDefaultPixelValue(1)
+    resample.SetDefaultPixelValue(itk_image.GetPixelIDValue())
 
     if is_label:
         resample.SetInterpolator(sitk.sitkNearestNeighbor)
@@ -51,8 +45,9 @@ def resample_image_standardize(itk_image, out_size=(64, 64, 64), is_label=False)
     reference_image = sitk.Image(out_size, 1)
     reference_image.SetDirection(itk_image.GetDirection())
     reference_image.SetSpacing(out_spacing)
-
+    reference_image.SetPixel 
     interpolator = sitk.sitkNearestNeighbor if is_label else sitk.sitkBSpline
+
     return sitk.Resample(itk_image, reference_image, sitk.Transform(), interpolator)
 
 def reslice_image(itk_image, itk_ref, is_label=False):
@@ -72,6 +67,12 @@ def normalize(image):
     image[image<0] = 0.
     return image
 
+def safe_mkdir(path):
+    if isinstance(path, list):
+        [safe_mkdir(p) for p in path]
+    elif not os.path.exists(path):
+        os.mkdir(path)
+
 def validate_bucket_download(hi_res_images_path, hi_res_masks_path):
     ### LOOK FOR MASKS AND IMAGE FILES
     masks_list = os.listdir(hi_res_masks_path)
@@ -83,7 +84,7 @@ def validate_bucket_download(hi_res_images_path, hi_res_masks_path):
 
     ### 1. VERIFY MATCHING NUMBER OF MASKS AND IMAGES
     if num_masks != num_images:
-        raise FileNotFoundError(f"Unequal number of masks and images in {hi_res_path}")
+        raise FileNotFoundError(f"Unequal number of masks and images.")
 
     masks_list.sort()
     images_list.sort()
@@ -95,7 +96,7 @@ def validate_bucket_download(hi_res_images_path, hi_res_masks_path):
         name_1 = ''.join(pair[1].split('.')[0].split('-')[1:])
         name_2 = ''.join(pair[0].split('.')[0].split('-')[1:])
         if (name_1 != name_2):
-            msg = f'Incomplete correspondence between masks and images in {hi_res_path}: '
+            msg = f'Incomplete correspondence between masks and images: '
             msg += f'found non-matching (mask, image) pair {name_1, name_2} from files {pair}.'
             raise FileNotFoundError(msg)
     
@@ -335,7 +336,6 @@ def crop_images_to_common_dimensions(imgs, fixed_bounding_ratios = (0.5, 0.5, 0.
         h_diff_im = h_img - h_min
         l_diff_im = l_img - l_min
 
-        # What do the dynamic ratios "do"? They
         if find_dynamic_bounding_ratios:
             label_shape_filter = sitk.LabelShapeStatisticsImageFilter()
             label_shape_filter.Execute(sitk.OtsuThreshold(img, 0, 1))
@@ -390,11 +390,9 @@ def crop_images_to_common_dimensions(imgs, fixed_bounding_ratios = (0.5, 0.5, 0.
                 length_ratio = min((a_k / b_k) / 2, 1 - (a_k / b_k) / 2)
                 print(1)
 
-        #width_ratio -= 0.2
         i_start = int(w_diff_im * width_ratio)
         i_end = int(w_img - w_diff_im * (1 - width_ratio))
 
-        #height_ratio += 0.35
         j_start = int(h_diff_im * height_ratio)
         j_end = int(h_img - h_diff_im * (1 - height_ratio))
 
@@ -452,57 +450,340 @@ def resample_images_standardize(imgs, out_size=(64, 64, 64), is_label=False, n_j
     with mp.Pool(processes=n_jobs) as p:
         return list(tqdm(p.imap(resample_image_standardize_helper, args), total=len(args)))
 
+####################################################################################################
 
-def resampling_pipeline(imgs, masks, out_spacing=(1.0, 1.0, 1.0),
-                        out_size=(64, 64, 64), masks_only=False, n_jobs=1):
-    """Resamples images to common voxel spacing, crops to common dimensions,
-    then resamples to 64x64x64 size, in that order.
+def respace_img(img_path_in, img_path_out, out_spacing, is_label):
+    img = sitk.ReadImage(img_path_in)
+    img = resample_image(img, out_spacing=out_spacing, is_label=is_label)
+    sitk.WriteImage(img, img_path_out)
+    new_size = img.GetSize()
+    print('Respace out:', new_size, img_path_out)
+    return (img_path_out, new_size)
 
-    Arguments:
-        imgs {[type]} -- [description]
-        masks {[type]} -- [description]
 
-    Keyword Arguments:
-        out_spacing {tuple} -- [description] (default: {(1.0, 1.0, 1.0)})
-        out_size {tuple} -- [description] (default: {(64, 64, 64)})
+# TODO: document sorting logic
+def respace_directories(paths_in=[], paths_out=[], is_labels=[], out_spacing=(), n_jobs=1) -> dict:
+    args = []
+    for dir_path_in, dir_path_out, is_label in zip(paths_in, paths_out, is_labels):
+        file_names_in = sorted(os.listdir(dir_path_in))
 
-    Returns:
-        tuple -- A two-tuple of image and mask lists
-    """
-
-    # Conceptually, the augmentation procedure is as follows: 
-    # 1. [RESPACING]  Resample images and masks to common (1x1x1) spacing
-    # 2. [CROPPING]   Crop images/masks to smallest image/mask pair dimensions
-    # 3. [RESIZING]   Resample images and masks to common (64x64x64) size
-
-    # This pipeline is designed to carry out the above steps with minimal
-    # runtime, storage, and memory requirements.
-
-    # 1. Assume a read-only directory containing hi-res image and mask pairs
-    # 2. Spawn parallel processes to read 1 hi-res file, respace, and write to file
-    #    Each process returns the new resulting size after the respacing operation
-    # 3. Determine the minimum sizing out of all returned sizes
-    # 3. Spawn parallel processes to read and remove 1 respaced file, crop, and write to file
-    # 4. Spawn parallel processes to read and remove 1 cropped file, resize, and write to file
-
-    print('Resampling mask spacing')
-    masks = resample_images(masks, out_spacing=out_spacing, is_label=True, n_jobs=n_jobs)
-    print('Cropping masks')
-    masks, bounding_ratios = crop_images_to_common_dimensions(masks, find_dynamic_bounding_ratios=True)
-    print('Resampling mask size')
-    masks = resample_images_standardize(masks, out_size=out_size, is_label=True, n_jobs=n_jobs)
+        for file_name_in in file_names_in:
+            file_path_in = os.path.join(dir_path_in, file_name_in)
+            file_path_out = os.path.join(dir_path_out, file_name_in)
+            args.append((file_path_in, file_path_out, out_spacing, is_label))
     
-    if masks_only:
-        return masks
-    
-    print('Resampling image spacing')
-    imgs = resample_images(imgs, out_spacing=out_spacing, is_label=False, n_jobs=n_jobs)
-    print('Cropping images')
-    imgs = crop_images_to_common_dimensions(imgs, dynamic_bounding_ratios=bounding_ratios)
-    print('Resampling image size')
-    imgs = resample_images_standardize(imgs, out_size=out_size, is_label=False, n_jobs=n_jobs)
+    with mp.Pool(processes=n_jobs) as pool:
+        path_size_pairs = list(pool.starmap(respace_img, args))
 
-    return imgs, masks
+    # Gather results and sort them by filename
+    result_dict = dict()
+    for path in paths_out:
+        result_dict[path] = ([], [])
+    
+    for path, size in path_size_pairs:
+        img_dir = os.path.split(path)[0]
+        img_name = os.path.split(path)[1]
+        result_dict[img_dir][0].append(img_name)
+        result_dict[img_dir][1].append(size)
+
+    for dir, name_size_pairs in result_dict.items():
+        name_size_pairs = list(zip(*name_size_pairs))
+        name_size_pairs = sorted(name_size_pairs, key=lambda x: x[0])
+        name_size_pairs = list(zip(*name_size_pairs))
+        sizes = name_size_pairs[1]
+        result_dict[dir] = list(sizes)
+    
+    return result_dict
+
+
+def find_dynamic_cropping_ratios_for_img(img_path, crop_to):
+    img = sitk.ReadImage(img_path)
+    w_img, h_img, l_img = img.GetSize()
+
+    w_diff_im = w_img - crop_to[0]
+    h_diff_im = h_img - crop_to[1]
+    l_diff_im = l_img - crop_to[2]
+
+    label_shape_filter = sitk.LabelShapeStatisticsImageFilter()
+    label_shape_filter.Execute(sitk.OtsuThreshold(img, 0, 1))
+    bounding_box = label_shape_filter.GetBoundingBox(1)
+
+    i_start_max, j_start_max, k_start_max = bounding_box[:3]
+    i_span_min, j_span_min, k_span_min = bounding_box[3:]
+
+    i_end_min = i_start_max + i_span_min
+    j_end_min = j_start_max + j_span_min
+    k_end_min = k_start_max + k_span_min
+
+    if (l_diff_im > l_img - k_span_min
+        or h_diff_im > h_img - j_span_min
+        or w_diff_im > w_img - i_span_min):
+        print((f'Bounding box on {img_path} does not meet minimum size ' +
+        'requirement for cropping; cropping will trespass minimum bounding box.'))
+
+    i_end_min_from_end = w_img - i_end_min
+    j_end_min_from_end = h_img - j_end_min
+    k_end_min_from_end = l_img - k_end_min
+
+    if i_start_max > i_end_min_from_end:
+        a_i = i_end_min_from_end
+        b_i = i_start_max
+        width_ratio = max((a_i / b_i) / 2, 1 - (a_i / b_i) / 2)
+    else:
+        b_i = i_end_min_from_end
+        a_i = i_start_max
+        width_ratio = min((a_i / b_i) / 2, 1 - (a_i / b_i) / 2)
+
+    if j_start_max > j_end_min_from_end:
+        a_j = j_end_min_from_end
+        b_j = j_start_max
+        height_ratio = max((a_j / b_j) / 2, 1 - (a_j / b_j) / 2)
+    else:
+        b_j = j_end_min_from_end
+        a_j = j_start_max
+        height_ratio = min((a_j / b_j) / 2, 1 - (a_j / b_j) / 2)
+
+    if k_start_max > k_end_min_from_end:
+        a_k = k_end_min_from_end
+        b_k = k_start_max
+        length_ratio = max((a_k / b_k) / 2, 1 - (a_k / b_k) / 2)
+    else:
+        b_k = k_end_min_from_end
+        a_k = k_start_max
+        length_ratio = min((a_k / b_k) / 2, 1 - (a_k / b_k) / 2)
+    
+    return width_ratio, height_ratio, length_ratio
+
+
+def find_dynamic_cropping_ratios_for_dir(dir_path_in, min_dims, n_jobs=1):
+    file_names_in = sorted(os.listdir(dir_path_in))
+    file_paths_in = [os.path.join(dir_path_in, name) for name in file_names_in]
+    args = [(path, min_dims) for path in file_paths_in]
+
+    with mp.Pool(processes=n_jobs) as pool:
+        return pool.starmap(find_dynamic_cropping_ratios_for_img, args)
+
+
+def crop_image(path_in, path_out, crop_to, cropping_ratio, remove_in):
+    img = sitk.ReadImage(path_in)
+
+    if remove_in:
+        os.remove(path_in)
+    
+    width_ratio, height_ratio, length_ratio = cropping_ratio
+
+    w_img, h_img, l_img = img.GetSize()
+    w_diff_im = w_img - crop_to[0]
+    h_diff_im = h_img - crop_to[1]
+    l_diff_im = l_img - crop_to[2]
+    
+    i_start = int(w_diff_im * width_ratio)
+    i_end = int(w_img - w_diff_im * (1 - width_ratio))
+
+    j_start = int(h_diff_im * height_ratio)
+    j_end = int(h_img - h_diff_im * (1 - height_ratio))
+
+    k_start = int(l_diff_im * (length_ratio))
+    k_end = int(l_img - l_diff_im * (1 - length_ratio))
+
+    img = img[i_start:i_end, j_start:j_end, k_start:k_end]
+    print('Crop out:', img.GetSize(), path_out)
+
+    sitk.WriteImage(img, path_out)
+
+
+def crop_directories(paths_in=[], paths_out=[], crop_to=(), cropping_ratios=(), inplace=False, n_jobs=1):
+    args = []
+    if inplace:
+        paths_out = paths_in
+    elif paths_out == []:
+        paths_out = paths_in
+        inplace = True
+
+    for i, (dir_path_in, dir_path_out) in enumerate(zip(paths_in, paths_out)):
+        file_names_in = sorted(os.listdir(dir_path_in))
+
+        for file_name_in in file_names_in:
+            path_in = os.path.join(dir_path_in, file_name_in)
+            path_out = os.path.join(dir_path_out, file_name_in)
+            cropping_ratio = cropping_ratios[i]
+            arg = (path_in, path_out, crop_to, cropping_ratio, inplace)
+            args.append(arg)
+    
+    with mp.Pool(processes=n_jobs) as pool:
+        pool.starmap_async(crop_image, args).get()
+
+
+def resize_image(path_in, path_out, out_size, is_label, remove_in):
+    img = sitk.ReadImage(path_in)
+    if remove_in:
+        os.remove(path_in)
+
+    img = resample_image_standardize(img, out_size=out_size, is_label=is_label)
+
+    print('Resize out:', img.GetSize(), path_out)
+    sitk.WriteImage(img, path_out)
+
+
+def resize_directories(paths_in=[], paths_out=[], is_labels=[], out_size=(), inplace=False, n_jobs=1):
+    args = []
+    if inplace:
+        paths_out = paths_in
+    elif paths_out==[]:
+        paths_out = paths_in
+        inplace = True
+
+    for dir_path_in, dir_path_out, is_label in zip(paths_in, paths_out, is_labels):
+        file_names_in = sorted(os.listdir(dir_path_in))
+
+        for file_name_in in file_names_in:
+            file_path_in = os.path.join(dir_path_in, file_name_in)
+            file_path_out = os.path.join(dir_path_out, file_name_in)
+            args.append((file_path_in, file_path_out, out_size, is_label, inplace))
+    
+    with mp.Pool(processes=n_jobs) as pool:
+        pool.starmap_async(resize_image, args).get()
+
+
+def augmentation_pipeline(img_path, msk_path, img_path_out, msk_path_out,
+                          out_spacing=(1, 1, 1), out_size=(64, 64, 64),
+                          n_jobs=1):
+
+    try:
+        mp.set_start_method('spawn')
+    except NameError:
+        pass
+
+    img_path = os.path.abspath(img_path)
+    msk_path = os.path.abspath(msk_path)
+    img_path_out = os.path.abspath(img_path_out)
+    msk_path_out = os.path.abspath(msk_path_out)
+
+    sizings = respace_directories(
+        paths_in=(img_path, msk_path),
+        paths_out=(img_path_out, msk_path_out),
+        is_labels=[False, True],
+        out_spacing=out_spacing,
+        n_jobs=n_jobs)
+    
+    msk_sizes = np.array(sizings[msk_path_out])
+    min_dims = msk_sizes.min(axis=0)
+
+    cropping_ratios = find_dynamic_cropping_ratios_for_dir(msk_path_out, min_dims)
+
+    crop_directories(
+        paths_in=(img_path_out, msk_path_out),
+        crop_to=min_dims,
+        cropping_ratios=cropping_ratios,
+        inplace=True,
+        n_jobs=n_jobs)
+
+    resize_directories(
+        paths_in=(img_path_out, msk_path_out),
+        is_labels=[False, True],
+        out_size=out_size,
+        inplace=True,
+        n_jobs=n_jobs
+    )
+
+def validate_augmentation(hi_res_images_path, hi_res_masks_path, lo_res_images_path, lo_res_masks_path):
+    lo_res_path = os.path.split(lo_res_images_path)[0]
+    hi_res_path = os.path.split(hi_res_images_path)[0]
+
+    ### LOOK FOR MASKS AND IMAGE FILES
+    masks_list = os.listdir(lo_res_masks_path)
+    images_list = os.listdir(lo_res_images_path)
+
+    ############## VERIFY DATA INTEGRITY ###############
+    num_masks = len(masks_list)
+    num_images = len(images_list) 
+
+    print('Testing data integrity...', end='')
+
+    ### 1. VERIFY MATCHING NUMBER OF MASKS AND IMAGES
+    if num_masks != num_images:
+        raise FileNotFoundError(f"Unequal number of masks and images in {lo_res_path}")
+
+    masks_list.sort()
+    images_list.sort()
+
+    image_mask_pairs = list(zip(images_list, masks_list))
+
+    ### 2. VERIFY 1-1 CORRESPONDENCE BETWEEN MASKS AND IMAGES
+    for pair in image_mask_pairs:
+        name_1 = ''.join(pair[1].split('.')[0].split('-')[1:])
+        name_2 = ''.join(pair[0].split('.')[0].split('-')[1:])
+        if (name_1 != name_2):
+            msg = f'Incomplete correspondence between masks and images in {lo_res_path}: '
+            msg += f'found non-matching (mask, image) pair {name_1, name_2} from files {pair}.'
+            raise FileNotFoundError(msg)
+    
+    ### 3. VERIFY 1-1 CORRESPONDENCE BETWEEN HI-RES AND LO-RES
+    hi_res_pairs = list(zip(sorted(os.listdir(hi_res_masks_path)), sorted(os.listdir(hi_res_images_path))))
+    
+    for hi_res_pair, lo_res_pair in zip(hi_res_pairs, image_mask_pairs):
+        lo_res_name_1 = ''.join(lo_res_pair[0].split('.')[0].split('-')[1:])
+        lo_res_name_2 = ''.join(lo_res_pair[1].split('.')[0].split('-')[1:])
+        hi_res_name_1 = ''.join(hi_res_pair[0].split('.')[0].split('-')[1:])
+        hi_res_name_2 = ''.join(hi_res_pair[1].split('.')[0].split('-')[1:])
+        
+        if lo_res_name_1 != hi_res_name_1 or lo_res_name_2 != hi_res_name_2:
+            msg = f'Incomplete correspondence between hi-res and lo-res in {lo_res_path} and {hi_res_path}. '
+            msg += f'Hi-res pair {hi_res_pair} does not match {lo_res_pair}. Did you finish resampling?'
+            raise FileNotFoundError(msg)
+
+    print('Passed!')
+    
+    ################# VERIFY LABEL QUANTIZATION ##################
+    
+    print('Testing label quantization...', end='')
+
+    expected_quantization = [0,1]
+    
+    for mask in os.listdir(lo_res_masks_path):
+        lo_res_mask_path = os.path.join(lo_res_masks_path, mask)
+        sample_mask_lo_res = sitk.ReadImage(lo_res_mask_path)
+        unique_values = list(pd.Series(sitk.GetArrayFromImage(sample_mask_lo_res).ravel()).unique())
+        if unique_values != expected_quantization:
+            raise ValueError('Masks arrays not quantized to the set {0, 1}. Did you pass is_label=True?')
+    else:
+        print(f'Passed! Quantized to {expected_quantization}')
+
+# def resampling_pipeline(imgs, masks, out_spacing=(1.0, 1.0, 1.0),
+#                         out_size=(64, 64, 64), masks_only=False, n_jobs=1):
+#     """Resamples images to common voxel spacing, crops to common dimensions,
+#     then resamples to 64x64x64 size, in that order.
+
+#     Arguments:
+#         imgs {[type]} -- [description]
+#         masks {[type]} -- [description]
+
+#     Keyword Arguments:
+#         out_spacing {tuple} -- [description] (default: {(1.0, 1.0, 1.0)})
+#         out_size {tuple} -- [description] (default: {(64, 64, 64)})
+
+#     Returns:
+#         tuple -- A two-tuple of image and mask lists
+#     """
+
+#     print('Resampling mask spacing')
+#     masks = resample_images(masks, out_spacing=out_spacing, is_label=True, n_jobs=n_jobs)
+#     print('Cropping masks')
+#     masks, bounding_ratios = crop_images_to_common_dimensions(masks, find_dynamic_bounding_ratios=True)
+#     print('Resampling mask size')
+#     masks = resample_images_standardize(masks, out_size=out_size, is_label=True, n_jobs=n_jobs)
+    
+#     if masks_only:
+#         return masks
+    
+#     print('Resampling image spacing')
+#     imgs = resample_images(imgs, out_spacing=out_spacing, is_label=False, n_jobs=n_jobs)
+#     print('Cropping images')
+#     imgs = crop_images_to_common_dimensions(imgs, dynamic_bounding_ratios=bounding_ratios)
+#     print('Resampling image size')
+#     imgs = resample_images_standardize(imgs, out_size=out_size, is_label=False, n_jobs=n_jobs)
+
+#     return imgs, masks
 
 def k3d_plot(img, color_range=None):
 
@@ -575,11 +856,25 @@ def animate_2d_plot(sitk_image, repeat=True):
             txt = plt.text(10, -3, f'{text}')
             imgs.append([img, txt])
 
-
-
-
     ani = animation.ArtistAnimation(fig, imgs, interval=100, blit=True,
                                     repeat_delay=1000, repeat=repeat)
 
     plt.close()
     return ani
+
+def imshow_sitk(img):
+    import matplotlib.pyplot as plt
+    return plt.imshow(sitk.GetArrayFromImage(img))
+
+def interact_sitk_helper(img, x0, x1, y0, y1, x):
+    shape = img.GetSize()
+    
+    x1 = min(shape[0], x1)
+    y1 = min(shape[1], y1)
+
+    imshow_sitk(img[x0:x1,y0:y1,x])
+
+def interact_sitk(image):
+    from ipywidgets import interact, fixed
+    shape = image.GetSize()
+    interact(interact_sitk_helper, x0 = (0, shape[0]//2), x1 = (shape[0]//2, shape[0]), y0 = (0, shape[1]//2), y1 = (shape[1]//2, shape[1]), img = fixed(image), x = (0, shape[2]-1))
