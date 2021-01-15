@@ -102,114 +102,6 @@ def validate_bucket_download(hi_res_images_path, hi_res_masks_path):
     
     return True
 
-# For information about the image types see the SimpleITK docs:
-# https://simpleitk.readthedocs.io/en/master/IO.html
-
-def resample_directory_helper(args):
-    """Helper function for resample_directory(). Resamples a single medical image and writes to the output path.
-
-    Arguments:
-        args {list} -- Packed args tuple containing the following:
-        file_name {str} -- Name of file or folder to resample
-        input_file_path {str} -- Path to file or folder to resample
-        output_file_path {str} -- Path to output file to write resampled image to
-        out_size {tuple} -- Shape to resample image to
-        is_label {bool} -- Determines whether to use the NearestNeighbor resampling function (True) or a B-spline (False)
-        image {str} -- The type of SimpleITK ImageIO reader to use 
-        output_type {str} -- If the input files or folders do not have an extension, this will determine the output extension type
-    """
-    file_name, input_file_path, output_file_path, out_size, is_label, image, output_type = args
-
-    # If the input image does not have a file extension specified,
-    # then append the specified file extension to the output filepath
-    # to be interpreted by sitk.WriteImage() later.
-    if '.' not in file_name:
-        output_file_path = output_file_path + '.' + output_type
-
-    if image == 'GDCMImageIO':
-        reader = sitk.ImageSeriesReader()
-
-        dicom_names = reader.GetGDCMSeriesFileNames(input_file_path)
-        reader.SetFileNames(dicom_names)
-
-        original = reader.Execute()
-
-    elif image == 'NiftiImageIO':
-        original = sitk.ReadImage(input_file_path, imageIO=image)
-
-    resampler = resample_image_standardize(original, out_size=out_size, is_label=is_label)
-
-    sitk.WriteImage(resampler, output_file_path)
-    
-
-def resample_directory(input_directory, output_directory, out_size=(64,64,64), is_label=False, image=None, output_type='nii', n_jobs=None):
-    """Resamples a given input directory of medical images and outputs to the specified output directory
-
-    Arguments:
-        input_directory {list} -- Directory to read images from
-        output_directory {list} -- Directory to write resampled images to
-
-    Keyword Arguments:
-        out_size {tuple} -- The shape of the resampled output (default: {(64,64,64)})
-        is_label {bool} -- Determines whether to use the NearestNeighbor resampling function (True) or a B-spline (False) (default: {False})
-        image {str} -- The type of SimpleITK ImageIO reader to use (default: {None})
-        output_type {str} -- If the input files or folders do not have an extension, this will determine the output extension type (default: {'nii'})
-        n_jobs {int} -- Number of CPU cores to use. `None` falls back to sequential operation and -1 will use all available cores (default: {None})
-    """
-
-    if n_jobs == 0 or n_jobs < -1:
-        raise ValueError(f'Illegal n_jobs argument value {n_jobs}. Legal values are None, -1, and n >= 1.')
-
-    args = []
-    
-    for file_name in os.listdir(input_directory):
-        
-        input_file_path = os.path.join(input_directory, file_name)
-        output_file_path = os.path.join(output_directory, file_name)
-
-        args.append((file_name, input_file_path, output_file_path, out_size, is_label, image, output_type))
-
-    if n_jobs is not None or n_jobs == 1:
-        if n_jobs == -1:
-            n_jobs = mp.cpu_count()
-        elif n_jobs > mp.cpu_count():
-            n_jobs = mp.cpu_count()
-
-        with mp.Pool(processes=n_jobs) as p:
-            list(tqdm(p.imap(resample_directory_helper, args), total=len(args)))
-    else:
-        for arg in tqdm(args):
-            resample_directory_helper(arg)
-
-
-def gunzip(source_filepath, dest_filepath, block_size=65536):
-    with gzip.open(source_filepath, 'rb') as s_file, \
-            open(dest_filepath, 'wb') as d_file:
-        while True:
-            block = s_file.read(block_size)
-            if not block:
-                break
-            else:
-                d_file.write(block)
-
-
-def unzip_glob(path, extension, remove_originals=False):
-    
-    extension = ''.join(extension.split('.'))
-    files = glob.glob(os.path.join(path, f'*.{extension}'))
-
-    for i, _ in enumerate(files):
-        destination = files[i].split('.' + extension)[0]
-        if extension == 'zip':
-            with ZipFile(files[i], 'r') as zipObj:
-                # Extract all the contents of zip file in current directory
-                zipObj.extractall(path=destination)
-
-        elif extension == 'gz':
-            gunzip(files[i], destination)
-
-        if remove_originals:
-            os.remove(files[i])
 
 def get_images(directory, n = 5):
     """Returns sitk.Image objects from the directory, sorted lexicographically
@@ -232,225 +124,9 @@ def get_images(directory, n = 5):
     imgs = [sitk.ReadImage(path) for path in paths]
     return imgs
 
-# TODO: Rewrite to take a list of (w, h, l) optionally instead of images
-def find_shape_extrema(imgs):
-    # (w)idth, (h)eight, (l)ength corresponds to maximum number of voxels along the
-    # x, y, z axis for a given picture
+######################## Augmentation Pipeline Code ###########################
 
-    # Starting values
-    w_max = 0
-    h_max = 0
-    l_max = 0
-
-    w_min = 1000
-    h_min = 1000
-    l_min = 1000
-
-    for img in imgs:
-        w, h, l = img.GetSize()
-
-        w_max = w if w > w_max else w_max
-        h_max = h if h > h_max else h_max
-        l_max = l if l > l_max else l_max
-
-        w_min = w if w < w_min else w_min
-        h_min = h if h < h_min else h_min
-        l_min = l if l < l_min else l_min
-
-    return (w_min, h_min, l_min), (w_max, h_max, l_max)
-
-# def crop_images_to_common_dimensions(imgs):
-
-#     (w_min, h_min, l_min), (w_max, h_max, l_max) = find_shape_extrema(imgs)
-
-#     new_imgs = []
-
-#     width_ratio = 0.5
-#     height_ratio = 0.5
-#     length_ratio = 0.5
-
-#     for img in tqdm(imgs):
-#         w_img = img.GetWidth()
-#         h_img = img.GetHeight()
-#         l_img = img.GetDepth()
-
-#         # These are the number of voxels to crop off each dimension,
-#         # in the proportions dictated by [width/height/length]_ratio
-#         w_diff_im = w_img - w_min
-#         h_diff_im = h_img - h_min
-#         l_diff_im = l_img - l_min
-
-#         i_start = int(w_diff_im // (1 / width_ratio))
-#         i_end = int(w_img - w_diff_im // (1 / (1 - width_ratio)))
-
-#         j_start = int(h_diff_im // (1 / height_ratio))
-#         j_end = int(h_img - h_diff_im // (1 / (1 - height_ratio)))
-
-#         k_start = int(l_diff_im // (1 / length_ratio))
-#         k_end = int(l_img - l_diff_im // (1 / (1 - length_ratio)))
-
-#         print(f'{i_start:3}:{i_end:3}, {j_start:3}:{j_end:3}, {k_start:3}:{k_end:3}; {w_img:3} - {w_diff_im:3}, {h_img:3} -  {h_diff_im:3}, {l_img:3} - {l_diff_im:3}')
-#         new_imgs.append(img[i_start:i_end, j_start:j_end, k_start:k_end])
-
-#     return new_imgs
-
-def threshold_based_crop(image, inside_value=0, outside_value=255):
-    """Use Otsu's threshold estimator to separate background and foreground.
-    Then crop the image using the foreground's axis aligned bounding box.
-    Arguments:
-        image (SimpleITK image): An image where the anatomy and background intensities form a bi-modal distribution
-                                 (the assumption underlying Otsu's method.)
-    Returns:
-        Cropped image based on foreground's axis aligned bounding box.                                 
-    """
-    # Set pixels that are in [min_intensity,otsu_threshold] to inside_value, values above otsu_threshold are
-    # set to outside_value. The anatomy has higher intensity values than the background, so it is outside.
-    label_shape_filter = sitk.LabelShapeStatisticsImageFilter()
-    label_shape_filter.Execute( sitk.OtsuThreshold(image, inside_value, outside_value) )
-    bounding_box = label_shape_filter.GetBoundingBox(outside_value)
-    # The bounding box's first "dim" entries are the starting index and last "dim" entries the size
-    return sitk.RegionOfInterest(image, bounding_box[int(len(bounding_box)/2):], bounding_box[0:int(len(bounding_box)/2)])
-
-
-def crop_images_to_common_dimensions(imgs, fixed_bounding_ratios = (0.5, 0.5, 0.5), dynamic_bounding_ratios = [],
-                                    find_dynamic_bounding_ratios=False):
-
-    (w_min, h_min, l_min), (w_max, h_max, l_max) = find_shape_extrema(imgs)
-
-    new_imgs = []
-
-    for i, img in tqdm(enumerate(imgs)):
-        print(i, end=': ')
-        if dynamic_bounding_ratios == []:
-            width_ratio, height_ratio, length_ratio = fixed_bounding_ratios
-        else:
-            width_ratio, height_ratio, length_ratio = dynamic_bounding_ratios[i]
-
-        w_img = img.GetWidth()
-        h_img = img.GetHeight()
-        l_img = img.GetDepth()
-
-        # These are the number of voxels to crop off each dimension,
-        # in the proportions dictated by [width/height/length]_ratio
-        w_diff_im = w_img - w_min
-        h_diff_im = h_img - h_min
-        l_diff_im = l_img - l_min
-
-        if find_dynamic_bounding_ratios:
-            label_shape_filter = sitk.LabelShapeStatisticsImageFilter()
-            label_shape_filter.Execute(sitk.OtsuThreshold(img, 0, 1))
-            bounding_box = label_shape_filter.GetBoundingBox(1)
-
-            i_start_max, j_start_max, k_start_max = bounding_box[:3]
-            i_span_min, j_span_min, k_span_min = bounding_box[3:]
-
-            i_end_min = i_start_max + i_span_min
-            j_end_min = j_start_max + j_span_min
-            k_end_min = k_start_max + k_span_min
-
-            if (l_diff_im > l_img - k_span_min
-                or h_diff_im > h_img - j_span_min
-                or w_diff_im > w_img - i_span_min):
-                print(f'Bounding box on mask {i} does not meet minimum size requirement for cropping; cropping will trespass minimum bounding box.')
-            
-            i_end_min_from_end = w_img - i_end_min
-            j_end_min_from_end = h_img - j_end_min
-            k_end_min_from_end = l_img - k_end_min
-
-            if i_start_max > i_end_min_from_end:
-                a_i = i_end_min_from_end
-                b_i = i_start_max
-                width_ratio = max((a_i / b_i) / 2, 1 - (a_i / b_i) / 2)
-                print(0, end=', ')
-            else:
-                b_i = i_end_min_from_end
-                a_i = i_start_max
-                width_ratio = min((a_i / b_i) / 2, 1 - (a_i / b_i) / 2)
-                print(1, end=', ')
-            
-            if j_start_max > j_end_min_from_end:
-                a_j = j_end_min_from_end
-                b_j = j_start_max
-                height_ratio = max((a_j / b_j) / 2, 1 - (a_j / b_j) / 2)
-                print(0, end=', ')
-            else:
-                b_j = j_end_min_from_end
-                a_j = j_start_max
-                height_ratio = min((a_j / b_j) / 2, 1 - (a_j / b_j) / 2)
-                print(1, end=', ')
-            
-            if k_start_max > k_end_min_from_end:
-                a_k = k_end_min_from_end
-                b_k = k_start_max
-                length_ratio = max((a_k / b_k) / 2, 1 - (a_k / b_k) / 2)
-                print(0)
-            else:
-                b_k = k_end_min_from_end
-                a_k = k_start_max
-                length_ratio = min((a_k / b_k) / 2, 1 - (a_k / b_k) / 2)
-                print(1)
-
-        i_start = int(w_diff_im * width_ratio)
-        i_end = int(w_img - w_diff_im * (1 - width_ratio))
-
-        j_start = int(h_diff_im * height_ratio)
-        j_end = int(h_img - h_diff_im * (1 - height_ratio))
-
-        k_start = int(l_diff_im * (length_ratio))
-        k_end = int(l_img - l_diff_im * (1 - length_ratio))
-
-        #print(f'{i_start:3}:{i_end:3}, {j_start:3}:{j_end:3}, {k_start:3}:{k_end:3}; {w_img:3} - {w_diff_im:3}, {h_img:3} -  {h_diff_im:3}, {l_img:3} - {l_diff_im:3}')
-        print(i_end-i_start, j_end-j_start, k_end-k_start)
-
-        new_imgs.append(img[i_start:i_end, j_start:j_end, k_start:k_end])
-        # new_imgs.append(img[k_start:k_end, j_start:j_end, i_start:i_end])
-
-    if find_dynamic_bounding_ratios:
-        return new_imgs, dynamic_bounding_ratios
-    else:
-        return new_imgs
-
-
-def resample_image_helper(arg):
-    img, out_spacing, is_label = arg
-    return resample_image(img, out_spacing, is_label)
-
-
-def resample_image_standardize_helper(arg):
-    img, out_size, is_label = arg
-    return resample_image_standardize(img, out_size, is_label)
-
-
-def resample_images(imgs, out_spacing=(1.0, 1.0, 1.0), is_label=False, n_jobs=mp.cpu_count()-1):
-    args = []
-    for img in imgs:
-        args.append((img, out_spacing, is_label))
-
-    if n_jobs == 1:
-        results = []
-        for arg in tqdm(args):
-            results.append(resample_image_helper(arg))
-        return results
-
-    with mp.Pool(processes=n_jobs) as p:
-        return list(tqdm(p.imap(resample_image_helper, args), total=len(args)))
-
-
-def resample_images_standardize(imgs, out_size=(64, 64, 64), is_label=False, n_jobs=mp.cpu_count()-1):
-    args = []
-    for img in imgs:
-        args.append((img, out_size, is_label))
-
-    if n_jobs == 1:
-        results = []
-        for arg in tqdm(args):
-            results.append(resample_image_standardize_helper(arg))
-        return results
-
-    with mp.Pool(processes=n_jobs) as p:
-        return list(tqdm(p.imap(resample_image_standardize_helper, args), total=len(args)))
-
-####################################################################################################
+# RESPACING FUNCTIONS #################
 
 def respace_img(img_path_in, img_path_out, out_spacing, is_label):
     img = sitk.ReadImage(img_path_in)
@@ -461,7 +137,10 @@ def respace_img(img_path_in, img_path_out, out_spacing, is_label):
     return (img_path_out, new_size)
 
 
-# TODO: document sorting logic
+# TODO: document return value sorting logic.
+# Basic idea is that pool.starmap_async() returns values out-of-order,
+# so we then need to re-order them the way they came into the function
+# (sorted lexicographically by filename)
 def respace_directories(paths_in=[], paths_out=[], is_labels=[], out_spacing=(), n_jobs=1) -> dict:
     args = []
     for dir_path_in, dir_path_out, is_label in zip(paths_in, paths_out, is_labels):
@@ -473,7 +152,7 @@ def respace_directories(paths_in=[], paths_out=[], is_labels=[], out_spacing=(),
             args.append((file_path_in, file_path_out, out_spacing, is_label))
     
     with mp.Pool(processes=n_jobs) as pool:
-        path_size_pairs = list(pool.starmap(respace_img, args))
+        path_size_pairs = list(pool.starmap_async(respace_img, args))
 
     # Gather results and sort them by filename
     result_dict = dict()
@@ -495,6 +174,38 @@ def respace_directories(paths_in=[], paths_out=[], is_labels=[], out_spacing=(),
     
     return result_dict
 
+# CROPPING FUNCTIONS ##################
+
+def threshold_based_crop(image, inside_value=0, outside_value=1):
+    """Use Otsu's threshold estimator to separate background and foreground.
+    Then crop the image using the foreground's axis aligned bounding box.
+
+    Arguments:
+        image {SimpleITK.Image}: An image where the anatomy and background
+            intensities form a bi-modal distribution (the assumption underlying
+            Otsu's method.)
+
+    Keyword Arguments:
+        inside_value {int} -- [Modal 1 value] (default: {0})
+        outside_value {int} -- [Modal 2 value] (default: {1})
+
+    Returns:
+        [SimpleITK.Image] -- Cropped image based on foreground's axis-aligned
+            bounding box.
+    """
+    
+    # Set pixels that are in [min_intensity,otsu_threshold] to inside_value,
+    # values above otsu_threshold are set to outside_value. The anatomy has
+    # higher intensity values than the background, so it is outside.
+    label_shape_filter = sitk.LabelShapeStatisticsImageFilter()
+    threshold = sitk.OtsuThreshold(image, inside_value, outside_value)
+    label_shape_filter.Execute(threshold)
+    bounding_box = label_shape_filter.GetBoundingBox(outside_value)
+
+    # The bounding box's first "dim" entries are the starting index and
+    # last "dim" entries are the size extending from the starting index
+    return sitk.RegionOfInterest(image, bounding_box[int(len(bounding_box)/2):],
+                                        bounding_box[0:int(len(bounding_box)/2)])
 
 def find_dynamic_cropping_ratios_for_img(img_path, crop_to):
     img = sitk.ReadImage(img_path)
@@ -613,6 +324,7 @@ def crop_directories(paths_in=[], paths_out=[], crop_to=(), cropping_ratios=(), 
     with mp.Pool(processes=n_jobs) as pool:
         pool.starmap_async(crop_image, args).get()
 
+# RESIZING FUNCTIONS ##################
 
 def resize_image(path_in, path_out, out_size, is_label, remove_in):
     img = sitk.ReadImage(path_in)
@@ -644,10 +356,26 @@ def resize_directories(paths_in=[], paths_out=[], is_labels=[], out_size=(), inp
     with mp.Pool(processes=n_jobs) as pool:
         pool.starmap_async(resize_image, args).get()
 
+# PIPELINE FUNCTIONS ##################
+
 
 def augmentation_pipeline(img_path, msk_path, img_path_out, msk_path_out,
                           out_spacing=(1, 1, 1), out_size=(64, 64, 64),
                           n_jobs=1):
+    """Respaces, crops, and resizes images and masks. Optional process-based
+    parallelism provided by n_jobs parameter.
+
+    Arguments:
+        img_path {[type]} -- Path to high-resolution images directory
+        msk_path {[type]} --  Path to high-resolution masks directory
+        img_path_out {[type]} --  Path to images output directory
+        msk_path_out {[type]} -- Path to masks output directory
+
+    Keyword Arguments:
+        out_spacing {tuple} -- Voxel spacing (default: {(1, 1, 1)})
+        out_size {tuple} -- Image size (default: {(64, 64, 64)})
+        n_jobs {int} -- Number of processes to use (default: {1})
+    """
 
     try:
         mp.set_start_method('spawn')
@@ -749,44 +477,10 @@ def validate_augmentation(hi_res_images_path, hi_res_masks_path, lo_res_images_p
     else:
         print(f'Passed! Quantized to {expected_quantization}')
 
-# def resampling_pipeline(imgs, masks, out_spacing=(1.0, 1.0, 1.0),
-#                         out_size=(64, 64, 64), masks_only=False, n_jobs=1):
-#     """Resamples images to common voxel spacing, crops to common dimensions,
-#     then resamples to 64x64x64 size, in that order.
 
-#     Arguments:
-#         imgs {[type]} -- [description]
-#         masks {[type]} -- [description]
-
-#     Keyword Arguments:
-#         out_spacing {tuple} -- [description] (default: {(1.0, 1.0, 1.0)})
-#         out_size {tuple} -- [description] (default: {(64, 64, 64)})
-
-#     Returns:
-#         tuple -- A two-tuple of image and mask lists
-#     """
-
-#     print('Resampling mask spacing')
-#     masks = resample_images(masks, out_spacing=out_spacing, is_label=True, n_jobs=n_jobs)
-#     print('Cropping masks')
-#     masks, bounding_ratios = crop_images_to_common_dimensions(masks, find_dynamic_bounding_ratios=True)
-#     print('Resampling mask size')
-#     masks = resample_images_standardize(masks, out_size=out_size, is_label=True, n_jobs=n_jobs)
-    
-#     if masks_only:
-#         return masks
-    
-#     print('Resampling image spacing')
-#     imgs = resample_images(imgs, out_spacing=out_spacing, is_label=False, n_jobs=n_jobs)
-#     print('Cropping images')
-#     imgs = crop_images_to_common_dimensions(imgs, dynamic_bounding_ratios=bounding_ratios)
-#     print('Resampling image size')
-#     imgs = resample_images_standardize(imgs, out_size=out_size, is_label=False, n_jobs=n_jobs)
-
-#     return imgs, masks
+######################### Plotting Utility Functions ##########################
 
 def k3d_plot(img, color_range=None):
-
     import k3d
     import numpy as np
         
